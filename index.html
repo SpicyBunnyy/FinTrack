@@ -9,7 +9,7 @@
 <title>FinTrack — Vault</title>
 <!-- Scripts -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
-<script src="https://accounts.google.com/gsi/client" defer></script>
+
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -315,7 +315,7 @@ function genId() { return Date.now().toString(36) + Math.random().toString(36).s
 
 function saveAllData() {
   localStorage.setItem('ft_state', encrypt(appState));
-  // Auto-backup to cloud if configured. Master-Mirror logic.
+  // Only auto-backup if we already have a valid token from this session
   if (appState.settings.gClientId && gToken) backupToDrive();
 }
 
@@ -356,7 +356,7 @@ function checkPin() {
     document.getElementById('pin-screen').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
     showScreen('dashboard');
-    if (appState.settings.gClientId) initDriveClient();
+    if (appState.settings.gClientId) setSyncUI('active'); // token handled on next backup tap
   } else {
     document.getElementById('pin-error').textContent = 'Incorrect PIN';
     pinClear();
@@ -633,17 +633,17 @@ function saveAccount() {
   if (currentViewAccId === id) openAccountDetails(id);
 }
 
-// ==================== GOOGLE DRIVE (BACKUP / RESTORE) ====================
+// ==================== GOOGLE DRIVE — REDIRECT FLOW (PWA SAFE) ====================
+// Uses OAuth redirect instead of popup — works in PWA standalone mode on iOS & Android
 let gToken = null;
-let gTokenExpiry = 0;
-let tokenClient = null;
 
+// ---- Helpers ----
 function validateClientIdInput(el) {
   const val = el.value.trim();
   const hint = document.getElementById('client-id-hint');
   if (!val) { hint.textContent = 'Paste your Client ID — ends with .apps.googleusercontent.com'; hint.style.color='var(--text3)'; return; }
   if (!val.endsWith('.apps.googleusercontent.com')) {
-    hint.textContent = '⚠️ This does not look like a valid Client ID. It must end with .apps.googleusercontent.com';
+    hint.textContent = '⚠️ Must end with .apps.googleusercontent.com';
     hint.style.color = 'var(--red)';
   } else {
     hint.textContent = '✓ Format looks correct';
@@ -659,72 +659,107 @@ function setSyncUI(status, detail) {
     if (statusText) statusText.textContent = 'Connected & Synced ✓';
   } else if (status === 'error') {
     badge.textContent = '⚠️ Sync Error'; badge.classList.remove('active');
-    if (statusText) statusText.textContent = detail || 'Auth error — check Client ID & console settings';
+    if (statusText) statusText.textContent = detail || 'Auth error';
   } else {
     badge.textContent = 'Local Only'; badge.classList.remove('active');
     if (statusText) statusText.textContent = 'Not connected';
   }
 }
 
+// ---- Build the exact redirect URI Google will return to ----
+function getRedirectUri() {
+  // Must exactly match what's in Cloud Console Redirect URIs
+  return window.location.origin + window.location.pathname.replace(/\/$/, '');
+}
+
+// ---- Step 1: Redirect user to Google consent page ----
+function startOAuthRedirect(action) {
+  const clientId = appState.settings.gClientId;
+  if (!clientId) { showToast('Save your Client ID first'); return; }
+
+  // Save what we want to do after auth returns ('backup' or 'restore')
+  sessionStorage.setItem('ft_oauth_action', action);
+  // Save current encrypted state so nothing is lost during redirect
+  sessionStorage.setItem('ft_pre_auth_state', localStorage.getItem('ft_state') || '');
+
+  const redirectUri = getRedirectUri();
+  const scope = 'https://www.googleapis.com/auth/drive.appdata';
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'token',          // implicit grant — no server needed
+    scope: scope,
+    include_granted_scopes: 'true',
+    state: action,                   // passed back in the hash so we know what to do
+  });
+
+  window.location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
+}
+
+// ---- Step 2: On page load, check if we've just returned from Google ----
+function handleOAuthReturn() {
+  // Google returns token in URL hash: #access_token=...&token_type=Bearer&expires_in=3599&state=...
+  if (!window.location.hash.includes('access_token')) return false;
+
+  const hash = window.location.hash.substring(1);
+  const params = new URLSearchParams(hash);
+  const token = params.get('access_token');
+  const error = params.get('error');
+  const action = params.get('state') || sessionStorage.getItem('ft_oauth_action') || 'backup';
+
+  // Clean the token from the URL immediately (security)
+  history.replaceState(null, '', window.location.pathname);
+
+  if (error || !token) {
+    setSyncUI('error', 'Google auth was cancelled or failed.');
+    showToast('Auth failed: ' + (error || 'no token'));
+    return true;
+  }
+
+  gToken = token;
+
+  // Restore pre-auth local state (in case redirect wiped sessionStorage on some browsers)
+  const preState = sessionStorage.getItem('ft_pre_auth_state');
+  if (preState && !localStorage.getItem('ft_state')) {
+    localStorage.setItem('ft_state', preState);
+  }
+  sessionStorage.removeItem('ft_oauth_action');
+  sessionStorage.removeItem('ft_pre_auth_state');
+
+  if (action === 'restore') {
+    performRestore();
+  } else {
+    backupToDrive();
+  }
+  return true;
+}
+
+// ---- Save settings & kick off redirect ----
 function saveDriveSettings() {
   const clientId = document.getElementById('gdrive-client-id').value.trim();
   if (!clientId) { showToast('Paste your Client ID first'); return; }
   if (!clientId.endsWith('.apps.googleusercontent.com')) {
-    alert('Invalid Client ID format. It must end with .apps.googleusercontent.com\n\nGo to Google Cloud Console → Credentials → copy the Web application Client ID.');
+    alert('Invalid Client ID. Must end with .apps.googleusercontent.com');
     return;
   }
   appState.settings.gClientId = clientId;
   saveAllData();
-  initDriveClient(true);
+  showToast('Redirecting to Google sign-in...');
+  setTimeout(() => startOAuthRedirect('backup'), 600);
 }
 
-function initDriveClient(forcePrompt = false) {
-  if (!appState.settings.gClientId) return;
-
-  // Guard: google.accounts must be loaded
-  if (typeof google === 'undefined' || !google.accounts) {
-    showToast('Google Auth library not loaded yet. Try again in a moment.');
-    return;
-  }
-
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: appState.settings.gClientId,
-    scope: 'https://www.googleapis.com/auth/drive.appdata',
-    callback: handleTokenResponse,
-    error_callback: handleTokenError,
-  });
-
-  if (forcePrompt) {
-    tokenClient.requestAccessToken({ prompt: 'consent' });
-  } else if (Date.now() < gTokenExpiry) {
-    // Token still valid, just backup
-    backupToDrive();
-  } else {
-    tokenClient.requestAccessToken({ prompt: '' });
-  }
+function manualDriveRestore() {
+  if (!appState.settings.gClientId) { alert('Enter and save your Client ID first'); return; }
+  if (!confirm('⚠️ This will overwrite your local data with the Google Drive backup. Proceed?')) return;
+  showToast('Redirecting to Google sign-in...');
+  setTimeout(() => startOAuthRedirect('restore'), 600);
 }
 
-function handleTokenResponse(response) {
-  if (response.error) { handleTokenError(response); return; }
-  gToken = response.access_token;
-  gTokenExpiry = Date.now() + ((response.expires_in || 3600) * 1000);
-  setSyncUI('active');
-  backupToDrive();
-}
-
-function handleTokenError(err) {
-  console.error('Google Auth Error:', err);
-  gToken = null;
-  const msg = err.type === 'popup_closed' ? 'Sign-in popup was closed' :
-              err.type === 'access_denied' ? 'Access denied. Add your email as Test User in OAuth Consent Screen.' :
-              'Auth failed. Check: Client ID type = Web application, Authorised Origins matches this URL, your email is a Test User.';
-  setSyncUI('error', msg);
-  showToast('Auth failed — see Settings for help');
-}
-
-// BACKUP: Overwrite Drive with local encrypted data
+// ---- BACKUP: push encrypted data to Drive ----
 async function backupToDrive() {
-  if (!gToken) return;
+  if (!gToken) { startOAuthRedirect('backup'); return; }
+  showToast('Backing up to Google Drive...');
   try {
     const cipherText = encrypt(appState);
     const metadata = { name: 'fintrack_vault.enc', parents: ['appDataFolder'] };
@@ -732,73 +767,62 @@ async function backupToDrive() {
     form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
     form.append('file', new Blob([cipherText], { type: 'text/plain' }));
 
-    // Check if file already exists
     const search = await fetch(
       'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D"fintrack_vault.enc"&fields=files(id)',
-      { headers: { Authorization: `Bearer ${gToken}` } }
+      { headers: { Authorization: 'Bearer ' + gToken } }
     );
-    if (search.status === 401) { gToken = null; setSyncUI('error', 'Token expired'); return; }
+    if (search.status === 401) { gToken = null; setSyncUI('error', 'Token expired — reconnect'); return; }
     const sData = await search.json();
 
     let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
     let method = 'POST';
     if (sData.files && sData.files.length > 0) {
-      url = `https://www.googleapis.com/upload/drive/v3/files/${sData.files[0].id}?uploadType=multipart`;
+      url = 'https://www.googleapis.com/upload/drive/v3/files/' + sData.files[0].id + '?uploadType=multipart';
       method = 'PATCH';
     }
-
-    const res = await fetch(url, { method, headers: { Authorization: `Bearer ${gToken}` }, body: form });
-    if (!res.ok) throw new Error(`Drive upload failed: ${res.status}`);
+    const res = await fetch(url, { method, headers: { Authorization: 'Bearer ' + gToken }, body: form });
+    if (!res.ok) throw new Error('Upload failed: ' + res.status);
     setSyncUI('active');
+    showToast('✓ Backed up to Google Drive!');
   } catch(e) {
     console.error('Backup error:', e);
-    setSyncUI('error', 'Backup failed');
+    setSyncUI('error', 'Backup failed — check connection');
   }
 }
 
-// RESTORE: Pull from Drive and overwrite local
-function manualDriveRestore() {
-  if (!appState.settings.gClientId) { alert('Enter and save your Client ID first'); return; }
-  if (!confirm('⚠️ This will overwrite your current local data with the Google Drive backup.\n\nYour current data will be lost. Proceed?')) return;
-
-  if (typeof google === 'undefined' || !google.accounts) { showToast('Google library not loaded yet'); return; }
-
-  const client = google.accounts.oauth2.initTokenClient({
-    client_id: appState.settings.gClientId,
-    scope: 'https://www.googleapis.com/auth/drive.appdata',
-    callback: async (response) => {
-      if (response.error) { handleTokenError(response); return; }
-      gToken = response.access_token;
-      showToast('Downloading backup...');
-      try {
-        const search = await fetch(
-          'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D"fintrack_vault.enc"&fields=files(id)',
-          { headers: { Authorization: `Bearer ${gToken}` } }
-        );
-        const data = await search.json();
-        if (!data.files || data.files.length === 0) { alert('No backup found in this Google Drive account.'); return; }
-
-        const fileRes = await fetch(
-          `https://www.googleapis.com/drive/v3/files/${data.files[0].id}?alt=media`,
-          { headers: { Authorization: `Bearer ${gToken}` } }
-        );
-        const cipherText = await fileRes.text();
-        const cloudState = decrypt(cipherText);
-
-        if (cloudState && cloudState.pin) {
-          appState = cloudState;
-          localStorage.setItem('ft_state', encrypt(appState));
-          setSyncUI('active');
-          showScreen('dashboard');
-          showToast('Restore successful! ✓');
-        } else {
-          alert('Decryption failed. Make sure you are using the same PIN that was used when the backup was made.');
-        }
-      } catch(e) { console.error('Restore error:', e); alert('Restore failed. See browser console for details.'); }
-    },
-    error_callback: handleTokenError,
-  });
-  client.requestAccessToken({ prompt: 'consent' });
+// ---- RESTORE: pull from Drive and overwrite local ----
+async function performRestore() {
+  if (!gToken) return;
+  showToast('Downloading from Google Drive...');
+  try {
+    const search = await fetch(
+      'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D"fintrack_vault.enc"&fields=files(id)',
+      { headers: { Authorization: 'Bearer ' + gToken } }
+    );
+    const data = await search.json();
+    if (!data.files || data.files.length === 0) {
+      alert('No backup found in this Google Drive account. Make sure you are signed in to the right Google account.');
+      return;
+    }
+    const fileRes = await fetch(
+      'https://www.googleapis.com/drive/v3/files/' + data.files[0].id + '?alt=media',
+      { headers: { Authorization: 'Bearer ' + gToken } }
+    );
+    const cipherText = await fileRes.text();
+    const cloudState = decrypt(cipherText);
+    if (cloudState && cloudState.pin) {
+      appState = cloudState;
+      localStorage.setItem('ft_state', encrypt(appState));
+      setSyncUI('active');
+      showScreen('dashboard');
+      showToast('✓ Restore successful!');
+    } else {
+      alert('Decryption failed. You must use the same PIN that was set when the backup was created.');
+    }
+  } catch(e) {
+    console.error('Restore error:', e);
+    alert('Restore failed. Check your internet connection and try again.');
+  }
 }
 
 function restoreFromSetup() {
@@ -808,7 +832,8 @@ function restoreFromSetup() {
   if (!clientId.endsWith('.apps.googleusercontent.com')) return alert('Invalid Client ID format.');
   appState.settings.gClientId = clientId;
   encKey = deriveKey(pin);
-  manualDriveRestore();
+  saveAllData();
+  startOAuthRedirect('restore');
 }
 
 // ==================== LAPTOP EXPORT (VIEW ONLY) ====================
@@ -833,7 +858,17 @@ function showToast(msg) { const t=document.getElementById('toast'); t.textConten
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
 // Run
-window.onload = initApp;
+window.onload = function() {
+  // First check if we've just returned from Google OAuth redirect
+  // This must happen before initApp so the token is captured before the hash is cleared
+  const wasOAuthReturn = handleOAuthReturn();
+  if (!wasOAuthReturn) {
+    initApp();
+  } else {
+    // We came back from OAuth — re-init the app (PIN was already unlocked before redirect)
+    initApp();
+  }
+};
 </script>
 </body>
 </html>
